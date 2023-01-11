@@ -63,17 +63,6 @@ operators = {
 }
 
 
-def preprocess_field_name(raw_field_name, only_undefined_field=False):
-    field_name = raw_field_name.replace("filter:tasks:", "")
-    if field_name.startswith("data."):
-        if only_undefined_field:
-            field_name = f'data__{settings.DATA_UNDEFINED_NAME}'
-        else:
-            field_name = field_name.replace("data.", "data__")
-
-    return field_name
-
-
 def get_fields_for_filter_ordering(prepare_params):
     result = []
     if prepare_params is None:
@@ -132,16 +121,10 @@ def get_fields_for_evaluation(prepare_params, user):
 
 def apply_ordering(queryset, ordering, only_undefined_field=False):
     if ordering:
-        field_name = ordering[0].replace("tasks:", "")
-        ascending = False if field_name[0] == '-' else True  # detect direction
-        field_name = field_name[1:] if field_name[0] == '-' else field_name  # remove direction
-        field_name = field_name.replace('agreement', '_agreement')
+        preprocess_field_name = load_func(settings.PREPROCESS_FIELD_NAME)
+        field_name, ascending = preprocess_field_name(ordering[0], only_undefined_field=only_undefined_field)
 
-        if "data." in field_name:
-            field_name = field_name.replace(".", "__", 1)
-            if only_undefined_field:
-                field_name = re.sub('data__\w+', f'data__{settings.DATA_UNDEFINED_NAME}', field_name)
-
+        if field_name.startswith('data__'):
             # annotate task with data field for float/int/bool ordering support
             json_field = field_name.replace('data__', '')
             queryset = queryset.annotate(ordering_field=KeyTextTransform(json_field, 'data'))
@@ -190,8 +173,8 @@ def apply_filters(queryset, filters, only_undefined_field=False):
             continue
 
         # django orm loop expression attached to column name
-        field_name = preprocess_field_name(_filter.filter, only_undefined_field)
-        field_name = field_name.replace('agreement', '_agreement')
+        preprocess_field_name = load_func(settings.PREPROCESS_FIELD_NAME)
+        field_name, _ = preprocess_field_name(_filter.filter, only_undefined_field)
 
         # filter preprocessing, value type conversion, etc..
         preprocess_filter = load_func(settings.DATA_MANAGER_PREPROCESS_FILTER)
@@ -516,6 +499,10 @@ def annotate_predictions_model_versions(queryset):
         return queryset.annotate(predictions_model_versions=ArrayAgg('predictions__model_version'))
 
 
+def annotate_avg_lead_time(queryset):
+    return queryset.annotate(avg_lead_time=Avg('annotations__lead_time'))
+
+
 def file_upload(queryset):
     return queryset.annotate(file_upload_field=F('file_upload__file'))
 
@@ -525,6 +512,7 @@ def dummy(queryset):
 
 
 settings.DATA_MANAGER_ANNOTATIONS_MAP = {
+    "avg_lead_time": annotate_avg_lead_time,
     "completed_at": annotate_completed_at,
     "annotations_results": annotate_annotations_results,
     "predictions_results": annotate_predictions_results,

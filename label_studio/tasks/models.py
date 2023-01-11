@@ -9,6 +9,7 @@ import numbers
 from urllib.parse import urljoin, quote
 
 from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
 from django.db import models, connection, transaction
 from django.db.models import Q, F, When, Count, Case, Subquery, OuterRef, Value
 from django.db.models.functions import Coalesce
@@ -19,15 +20,18 @@ from django.urls import reverse
 from django.utils.timesince import timesince
 from django.utils.timezone import now
 from django.dispatch import receiver, Signal
+from django.core.files.storage import default_storage
 from rest_framework.exceptions import ValidationError
 
-from model_utils import FieldTracker
-
+from core.feature_flags import flag_set
 from core.utils.common import find_first_one_to_one_related_field_by_prefix, string_is_url, load_func
 from core.utils.params import get_env
 from core.label_config import SINGLE_VALUED_TAGS
+from core.current_request import get_current_request
 from data_manager.managers import PreparedTaskManager, TaskManager
 from core.bulk_update_utils import bulk_update
+from data_import.models import FileUpload
+
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,9 @@ class Task(TaskMixin, models.Model):
                                 help_text='Project ID for this task')
     created_at = models.DateTimeField(_('created at'), auto_now_add=True, help_text='Time a task was created')
     updated_at = models.DateTimeField(_('updated at'), auto_now=True, help_text='Last time a task was updated')
+    updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='updated_tasks',
+                                   on_delete=models.SET_NULL, null=True, verbose_name=_('updated by'),
+                                   help_text='Last annotator or reviewer who updated this task')
     is_labeled = models.BooleanField(_('is_labeled'), default=False,
                                      help_text='True if the number of annotations for this task is greater than or equal '
                                                'to the number of maximum_completions for the project', db_index=True)
@@ -58,6 +65,8 @@ class Task(TaskMixin, models.Model):
         'data_import.FileUpload', on_delete=models.SET_NULL, null=True, blank=True, related_name='tasks',
         help_text='Uploaded file used as data source for this task'
     )
+    inner_id = models.BigIntegerField(_('inner id'), default=0, db_index=True, null=True,
+                                      help_text='Internal task ID in the project, starts with 1')
     updates = ['is_labeled']
 
     objects = TaskManager()  # task manager by default
@@ -68,6 +77,7 @@ class Task(TaskMixin, models.Model):
         ordering = ['-updated_at']
         indexes = [
             models.Index(fields=['project', 'is_labeled']),
+            models.Index(fields=['id', 'project']),
             models.Index(fields=['id', 'overlap']),
             models.Index(fields=['overlap']),
             models.Index(fields=['is_labeled'])
@@ -97,8 +107,10 @@ class Task(TaskMixin, models.Model):
     def has_lock(self, user=None):
         """Check whether current task has been locked by some user"""
         num_locks = self.num_locks
-        num_annotations = self.annotations.filter(ground_truth=False)\
-            .exclude(Q(was_cancelled=True) & ~Q(completed_by=user)).count()
+        if self.project.skip_queue == self.project.SkipQueue.REQUEUE_FOR_ME:
+            num_annotations = self.annotations.filter(ground_truth=False).exclude(Q(was_cancelled=True) | ~Q(completed_by=user)).count()
+        else:
+            num_annotations = self.annotations.filter(ground_truth=False).exclude(Q(was_cancelled=True) & ~Q(completed_by=user)).count()
 
         num = num_locks + num_annotations
         if num > self.overlap:
@@ -110,7 +122,9 @@ class Task(TaskMixin, models.Model):
                     num_annotations=num_annotations,
                 )
             )
-        return num >= self.overlap
+        result = bool(num >= self.overlap)
+        logger.debug(f'Task {self} locked: {result}; num_locks: {num_locks} num_annotations: {num_annotations}')
+        return result
 
     @property
     def num_locks(self):
@@ -155,20 +169,40 @@ class Task(TaskMixin, models.Model):
         # TODO: how to get neatly any storage class here?
         return find_first_one_to_one_related_field_by_prefix(self, '.*io_storages_')
 
-    def resolve_uri(self, task_data, proxy=True):
-        if proxy and self.project.task_data_login and self.project.task_data_password:
+    @staticmethod
+    def is_upload_file(filename):
+        if not isinstance(filename, str):
+            return False
+        return filename.startswith(settings.UPLOAD_DIR + '/')
+
+    def resolve_uri(self, task_data, project):
+        if project.task_data_login and project.task_data_password:
             protected_data = {}
             for key, value in task_data.items():
                 if isinstance(value, str) and string_is_url(value):
-                    path = reverse('projects-file-proxy', kwargs={'pk': self.project.pk}) + '?url=' + quote(value)
+                    path = reverse('projects-file-proxy', kwargs={'pk': project.pk}) + '?url=' + quote(value)
                     value = urljoin(settings.HOSTNAME, path)
                 protected_data[key] = value
             return protected_data
         else:
-            # Try resolve URLs via storage associated with that task
-            storage = self.storage
+            storage_objects = project.get_all_storage_objects(type_='import')
+
+            # try resolve URLs via storage associated with that task
             for field in task_data:
-                storage = storage or self._get_storage_by_url(task_data[field])
+                # file saved in django file storage
+                if settings.CLOUD_FILE_STORAGE_ENABLED and self.is_upload_file(task_data[field]):
+                    # permission check: resolve uploaded files to the project only
+                    file_upload = FileUpload.objects.filter(project=project, file=task_data[field])
+                    if file_upload.exists():
+                        task_data[field] = default_storage.url(name=task_data[field])
+                    # it's very rare case, e.g. user tried to reimport exported file from another project
+                    # or user wrote his django storage path manually
+                    else:
+                        task_data[field] = task_data[field] + '?not_uploaded_project_file'
+                    continue
+
+                # project storage
+                storage = self.storage or self._get_storage_by_url(task_data[field], storage_objects)
                 if storage:
                     try:
                         resolved_uri = storage.resolve_uri(task_data[field])
@@ -179,15 +213,15 @@ class Task(TaskMixin, models.Model):
                         task_data[field] = resolved_uri
             return task_data
 
-    def _get_storage_by_url(self, url):
-        """Find the first compatible storage and returns presigned URL"""
+    def _get_storage_by_url(self, url, storage_objects):
+        """Find the first compatible storage and returns pre-signed URL"""
         from io_storages.models import get_storage_classes
 
-        for storage_class in get_storage_classes('import'):
-            storage_objects = storage_class.objects.filter(project=self.project)
-            for storage_object in storage_objects:
-                if storage_object.can_resolve_url(url):
-                    return storage_object
+        for storage_object in storage_objects:
+            # check url is string because task can have int, float, dict, list
+            # and 'can_resolve_url' will fail
+            if isinstance(url, str) and storage_object.can_resolve_url(url):
+                return storage_object
 
     @property
     def storage(self):
@@ -206,7 +240,10 @@ class Task(TaskMixin, models.Model):
     @property
     def completed_annotations(self):
         """Annotations that we take into account when set completed status to the task"""
-        return self.annotations.filter(Q_finished_annotations & Q(ground_truth=False))
+        if self.project.skip_queue == self.project.SkipQueue.IGNORE_SKIPPED:
+            return self.annotations
+        else:
+            return self.annotations.filter(Q_finished_annotations)
 
     def update_is_labeled(self):
         self.is_labeled = self._get_is_labeled_value()
@@ -223,6 +260,16 @@ class Task(TaskMixin, models.Model):
 
     def ensure_unique_groundtruth(self, annotation_id):
         self.annotations.exclude(id=annotation_id).update(ground_truth=False)
+
+    def save(self, *args, **kwargs):
+        if flag_set('ff_back_2070_inner_id_12052022_short', self.project.organization.created_by):
+            if self.inner_id == 0:
+                task = Task.objects.filter(project=self.project).order_by("-inner_id").first()
+                max_inner_id = 1
+                if task:
+                    max_inner_id = task.inner_id
+                self.inner_id = max_inner_id + 1
+        super().save(*args, **kwargs)
 
 
 pre_bulk_create = Signal(providing_args=["objs", "batch_size"])
@@ -253,7 +300,6 @@ class Annotation(AnnotationMixin, models.Model):
     """ Annotations & Labeling results
     """
     objects = AnnotationManager()
-    tracker = FieldTracker(fields=['ground_truth', 'result'])
 
     result = JSONField('result', null=True, default=None, help_text='The main value of annotator work - '
                                                                     'labeling result in JSON format')
@@ -284,6 +330,7 @@ class Annotation(AnnotationMixin, models.Model):
         db_table = 'task_completion'
         indexes = [
             models.Index(fields=['task', 'ground_truth']),
+            models.Index(fields=['task', 'completed_by']),
             models.Index(fields=['was_cancelled']),
             models.Index(fields=['ground_truth']),
             models.Index(fields=['created_at']),
@@ -316,6 +363,27 @@ class Annotation(AnnotationMixin, models.Model):
             logger.debug(f'Decrease project.summary counters from {self}')
             summary = self.task.project.summary
             summary.remove_created_annotations_and_labels([self])
+
+    def update_task(self):
+        update_fields = ['updated_at']
+
+        # updated_by
+        request = get_current_request()
+        if request:
+            self.task.updated_by = request.user
+            update_fields.append('updated_by')
+
+        self.task.save(update_fields=update_fields)
+
+    def save(self, *args, **kwargs):
+        result = super().save(*args, **kwargs)
+        self.update_task()
+        return result
+
+    def delete(self, *args, **kwargs):
+        result = super().delete(*args, **kwargs)
+        self.update_task()
+        return result
 
 
 class TaskLock(models.Model):
@@ -395,7 +463,7 @@ class Prediction(models.Model):
         elif isinstance(result, dict):
             # "value" from result
             # TODO: validate value fields according to project.label_config
-            for tag, tag_info in project.get_control_tags_from_config().items():
+            for tag, tag_info in project.get_parsed_config().items():
                 tag_type = tag_info['type'].lower()
                 if tag_type in result:
                     return [{
@@ -407,7 +475,7 @@ class Prediction(models.Model):
 
         elif isinstance(result, (str, numbers.Integral)):
             # If result is of integral type, it could be a representation of data from single-valued control tags (e.g. Choices, Rating, etc.)  # noqa
-            for tag, tag_info in project.get_control_tags_from_config().items():
+            for tag, tag_info in project.get_parsed_config().items():
                 tag_type = tag_info['type'].lower()
                 if tag_type in SINGLE_VALUED_TAGS and isinstance(result, SINGLE_VALUED_TAGS[tag_type]):
                     return [{
@@ -421,10 +489,29 @@ class Prediction(models.Model):
         else:
             raise ValidationError(f'Incorrect format {type(result)} for prediction result {result}')
 
+    def update_task(self):
+        update_fields = ['updated_at']
+
+        # updated_by
+        request = get_current_request()
+        if request:
+            self.task.updated_by = request.user
+            update_fields.append('updated_by')
+
+        self.task.save(update_fields=update_fields)
+
     def save(self, *args, **kwargs):
         # "result" data can come in different forms - normalize them to JSON
         self.result = self.prepare_prediction_result(self.result, self.task.project)
+        # set updated_at field of task to now()
+        self.update_task()
         return super(Prediction, self).save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        result = super().delete(*args, **kwargs)
+        # set updated_at field of task to now()
+        self.update_task()
+        return result
 
     class Meta:
         db_table = 'prediction'
@@ -536,8 +623,6 @@ def update_is_labeled_after_removing_annotation(sender, instance, **kwargs):
 def delete_draft(sender, instance, **kwargs):
     task = instance.task
     query_args = {'task': instance.task, 'annotation': instance}
-    if instance.completed_by is not None:
-        query_args['user'] = instance.completed_by
     drafts = AnnotationDraft.objects.filter(**query_args)
     num_drafts = drafts.count()
     drafts.delete()

@@ -8,16 +8,24 @@ import pathlib
 import shutil
 
 from django.core.files import File
+from django.core.files import temp as tempfile
 from django.db import transaction
 from django.db.models import Prefetch
 from django.db.models.query_utils import Q
 from django.utils import dateformat, timezone
 import django_rq
 from label_studio_converter import Converter
+from django.conf import settings
 
 from core.redis import redis_connected
 from core.utils.common import batch
-from core.utils.io import get_all_files_from_dir, get_temp_dir, read_bytes_stream
+from core.utils.io import (
+    get_all_files_from_dir,
+    get_temp_dir,
+    read_bytes_stream,
+    get_all_dirs_from_dir,
+    SerializableGenerator,
+)
 from data_manager.models import View
 from projects.models import Project
 from tasks.models import Annotation, Task
@@ -126,7 +134,9 @@ class ExportMixin:
                 'annotations__completed_by'
             ].get('only_id'):
                 options['expand'].append('annotations.completed_by')
-
+            options['context'] = {'interpolate_key_frames': settings.INTERPOLATE_KEY_FRAMES}
+            if 'interpolate_key_frames' in serialization_options:
+                options['context']['interpolate_key_frames'] = serialization_options['interpolate_key_frames']
         return options
 
     def get_task_queryset(self, ids, annotation_filter_options):
@@ -138,7 +148,9 @@ class ExportMixin:
                 "annotations",
                 queryset=annotations_qs,
             )
-        )
+        ).select_related('project').prefetch_related(
+                'predictions', 'drafts'
+            )
 
     def get_export_data(self, task_filter_options=None, annotation_filter_options=None, serialization_options=None):
         """
@@ -170,11 +182,9 @@ class ExportMixin:
         with transaction.atomic():
             # TODO: make counters from queryset
             # counters = Project.objects.with_counts().filter(id=self.project.id)[0].get_counters()
-            counters = {'task_number': 0}
+            self.counters = {'task_number': 0}
             result = []
-            all_tasks = self.project.tasks.select_related('project').prefetch_related(
-                'annotations', 'predictions', 'drafts'
-            )
+            all_tasks = self.project.tasks
             logger.debug('Tasks filtration')
             task_ids = (
                 self._get_filtered_tasks(all_tasks, task_filter_options=task_filter_options)
@@ -189,13 +199,34 @@ class ExportMixin:
                 tasks = list(self.get_task_queryset(ids, annotation_filter_options))
                 logger.debug(f'Batch: {i*BATCH_SIZE}')
                 if isinstance(task_filter_options, dict) and task_filter_options.get('only_with_annotations'):
-                    tasks = [task for task in tasks if task.annotations.all()]
+                    tasks = [task for task in tasks if task.annotations.exists()]
 
                 serializer = ExportDataSerializer(tasks, many=True, **base_export_serializer_option)
-                result += serializer.data
+                self.counters['task_number'] += len(tasks)
+                for task in serializer.data:
+                    yield task
 
-        counters['task_number'] = len(result)
-        return result, counters
+    @staticmethod
+    def eval_md5(file):
+        md5_object = hashlib.md5()
+        block_size = 128 * md5_object.block_size
+        chunk = file.read(block_size)
+        while chunk:
+            md5_object.update(chunk)
+            chunk = file.read(block_size)
+        md5 = md5_object.hexdigest()
+        return md5
+
+    def save_file(self, file, md5):
+        now = datetime.now()
+        file_name = f'project-{self.project.id}-at-{now.strftime("%Y-%m-%d-%H-%M")}-{md5[0:8]}.json'
+        file_path = (
+            f'{self.project.id}/{file_name}'
+        )  # finally file will be in settings.DELAYED_EXPORT_DIR/self.project.id/file_name
+        file_ = File(file, name=file_path)
+        self.file.save(file_path, file_)
+        self.md5 = md5
+        self.save(update_fields=['file', 'md5', 'counters'])
 
     def export_to_file(self, task_filter_options=None, annotation_filter_options=None, serialization_options=None):
         logger.debug(
@@ -205,27 +236,27 @@ class ExportMixin:
             f'serialization_options: {serialization_options}\n'
         )
         try:
-            data, counters = self.get_export_data(
-                task_filter_options=task_filter_options,
-                annotation_filter_options=annotation_filter_options,
-                serialization_options=serialization_options,
+            iter_json = json.JSONEncoder(ensure_ascii=False).iterencode(
+                SerializableGenerator(
+                    self.get_export_data(
+                        task_filter_options=task_filter_options,
+                        annotation_filter_options=annotation_filter_options,
+                        serialization_options=serialization_options,
+                    )
+                )
             )
+            with tempfile.NamedTemporaryFile(suffix=".export.json", dir=settings.FILE_UPLOAD_TEMP_DIR) as file:
+                for chunk in iter_json:
+                    encoded_chunk = chunk.encode('utf-8')
+                    file.write(encoded_chunk)
+                file.seek(0)
 
-            now = datetime.now()
-            json_data = json.dumps(data, ensure_ascii=False).encode('utf-8')
-            md5 = hashlib.md5(json_data).hexdigest()
-            file_name = f'project-{self.project.id}-at-{now.strftime("%Y-%m-%d-%H-%M")}-{md5[0:8]}.json'
-            file_path = (
-                f'{self.project.id}/{file_name}'
-            )  # finlay file will be in settings.DELAYED_EXPORT_DIR/self.project.id/file_name
-            file_ = File(io.BytesIO(json_data), name=file_path)
-            self.file.save(file_path, file_)
-            self.md5 = md5
-            self.counters = counters
-            self.save(update_fields=['file', 'md5', 'counters'])
+                md5 = self.eval_md5(file)
+                self.save_file(file, md5)
 
             self.status = self.Status.COMPLETED
             self.save(update_fields=['status'])
+
         except Exception as exc:
             self.status = self.Status.FAILED
             self.save(update_fields=['status'])
@@ -281,10 +312,11 @@ class ExportMixin:
             converter.convert(input_file_path, out_dir, to_format, is_dir=False)
 
             files = get_all_files_from_dir(out_dir)
+            dirs = get_all_dirs_from_dir(out_dir)
 
-            if len(files) == 0:
+            if len(files) == 0 and len(dirs) == 0:
                 return None
-            elif len(files) == 1:
+            elif len(files) == 1 and len(dirs) == 0:
                 output_file = files[0]
                 filename = pathlib.Path(input_name).stem + pathlib.Path(output_file).suffix
             else:

@@ -12,7 +12,7 @@ from data_manager.prepare_params import PrepareParams
 from data_manager.models import View
 from tasks.models import Task
 from urllib.parse import unquote
-
+from core.feature_flags import flag_set
 
 TASKS = 'tasks:'
 logger = logging.getLogger(__name__)
@@ -32,9 +32,16 @@ def get_all_columns(project, *_):
     i = 0
 
     data_types = OrderedDict()
+
     # add data types from config again
-    project_data_types = project.data_types
+    project_data_types = {}
+    for key, value in project.data_types.items():
+        # skip keys from Repeater tag, because we already have its base data,
+        # e.g.: skip 'image[{{idx}}]' because we have 'image' list already
+        if '[' not in key:
+            project_data_types[key] = value
     data_types.update(project_data_types.items())
+
     # all data types from import data
     all_data_columns = project.summary.all_data_columns
     if all_data_columns:
@@ -81,7 +88,23 @@ def get_all_columns(project, *_):
                 'explore': True,
                 'labeling': False
             }
-        },
+        }
+    ]
+
+    if flag_set('ff_back_2070_inner_id_12052022_short', user=project.organization.created_by):
+        result['columns'] += [{
+            'id': 'inner_id',
+            'title': "Inner ID",
+            'type': 'Number',
+            'help': 'Internal task ID starting from 1 for the current project',
+            'target': 'tasks',
+            'visibility_defaults': {
+                'explore': False,
+                'labeling': False
+            }
+        }]
+
+    result['columns'] += [
         {
             'id': 'completed_at',
             'title': 'Completed',
@@ -215,6 +238,40 @@ def get_all_columns(project, *_):
                 'explore': False,
                 'labeling': False
             }
+        },
+        {
+            'id': 'updated_at',
+            'title': 'Updated at',
+            'type': 'Datetime',
+            'target': 'tasks',
+            'help': 'Task update time',
+            'visibility_defaults': {
+                'explore': False,
+                'labeling': False
+            }
+        },
+        {
+            'id': 'updated_by',
+            'title': 'Updated by',
+            'type': 'List',
+            'target': 'tasks',
+            'help': 'User who did the last task update',
+            'schema': {'items': project.organization.members.values_list('user__id', flat=True)},
+            'visibility_defaults': {
+                'explore': False,
+                'labeling': False
+            }
+        },
+        {
+            'id': 'avg_lead_time',
+            'title': "Lead Time",
+            'type': 'Number',
+            'help': 'Average lead time over all annotations (seconds)',
+            'target': 'tasks',
+            'visibility_defaults': {
+                'explore': False,
+                'labeling': False
+            }
         }
     ]
 
@@ -285,3 +342,16 @@ def custom_filter_expressions(*args, **kwargs):
 
 def preprocess_filter(_filter, *_):
     return _filter
+
+
+def preprocess_field_name(raw_field_name, only_undefined_field=False):
+    field_name = raw_field_name.replace("filter:", "")
+    field_name = field_name.replace("tasks:", "")
+    ascending = False if field_name[0] == '-' else True  # detect direction
+    field_name = field_name[1:] if field_name[0] == '-' else field_name  # remove direction
+    if field_name.startswith("data."):
+        if only_undefined_field:
+            field_name = f'data__{settings.DATA_UNDEFINED_NAME}'
+        else:
+            field_name = field_name.replace("data.", "data__")
+    return field_name, ascending
